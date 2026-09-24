@@ -1,0 +1,7 @@
+﻿__pycache__/
+*.py[cod]
+.env
+*.log
+rules.py
+immich_key.txt
+*token*.txt

@@ -1,0 +1,83 @@
+# Наши сервисы рядом с Immich. Подключается вторым файлом:
+#   docker compose -f docker-compose.yml -f frame.yml up -d
+# Compose Immich не правится: при обновлении Immich этот файл остаётся как есть.
+#
+# frame_postgres  - своя база: признаки снимков, люди-типы, ручные правки,
+#                   журнал карантина. Из базы Immich только читаем.
+# frame_worker    - все наши манипуляции одним контейнером: сборщик альбомов,
+#                   память правок, корзина Immich -> карантин на диске.
+#                   Запускается по команде, не демон.
+# frame_proxy     - nginx перед Immich с CORS-заголовками, порт 2284: без него
+#                   wallpanel из браузера рамки в API Immich не попадёт.
+
+services:
+  frame_postgres:
+    container_name: frame_postgres
+    # тот же образ, что у Immich - уже скачан, ничего нового не тянем
+    image: ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0@sha256:bcf63357191b76a916ae5eb93464d65c07511da41e3bf7a8416db519b40b1c23
+    environment:
+      POSTGRES_PASSWORD: ${FRAME_DB_PASSWORD}
+      POSTGRES_USER: frame
+      POSTGRES_DB: frame
+      POSTGRES_INITDB_ARGS: '--data-checksums'
+    volumes:
+      - ${FRAME_DB_LOCATION}:/var/lib/postgresql/data
+    shm_size: 64mb
+    restart: unless-stopped
+    healthcheck:
+      test: pg_isready -U frame -d frame || exit 1
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  frame_worker:
+    container_name: frame_worker
+    build: ./frame_worker
+    environment:
+      FRAME_DB: postgresql://frame:${FRAME_DB_PASSWORD}@frame_postgres:5432/frame
+      IMMICH_DB: postgresql://${DB_USERNAME}:${DB_PASSWORD}@database:5432/${DB_DATABASE_NAME}
+      IMMICH_URL: http://immich-server:2283
+      IMMICH_KEY_FILE: /run/secrets/immich_key
+      ARHIV: /mnt/arhiv
+      QUARANTINE: /mnt/arhiv_quarantine
+      IMMICH_LIBRARY: /mnt/immich_library
+      OLLAMA: http://HOST:11434
+      MODEL: qwen3.5:4b
+      TZ: ${TZ}
+    volumes:
+      # превью Immich (/data внутри immich-server): модель смотрит на них,
+      # оригиналы с архива ей не нужны
+      - "${UPLOAD_LOCATION}:/mnt/immich_library:ro"
+      # архив на запись - единственное, что воркер там делает, это переносит
+      # в карантин снимки из корзины Immich по команде trash --apply.
+      # Карантин держать на том же диске, что архив: тогда перенос - переименование.
+      - "${ARHIV_HOST}:/mnt/arhiv"
+      - "${QUARANTINE_HOST}:/mnt/arhiv_quarantine"
+      # кэши v1 (quality/vision/skin/people-roles) для разового импорта
+      - "${STATE_HOST}:/mnt/state:ro"
+      # рабочие файлы воркера: копии дашборда, контактные листы.
+      # Отдельно от карантина: там должны лежать только вынесенные снимки,
+      # иначе папку принимают за мусорную и удаляют вместе с привязкой.
+      - "${OUT_HOST}:/mnt/out"
+      - ./frame_worker/immich_key.txt:/run/secrets/immich_key:ro
+    depends_on:
+      frame_postgres:
+        condition: service_healthy
+      database:
+        condition: service_started
+    # контейнер живёт, но ничего не делает; команды - через docker exec
+    command: ["sleep", "infinity"]
+    restart: unless-stopped
+
+  # Immich с CORS для wallpanel: рамка ходит в API из браузера, со страницы HA,
+  # а Immich чужие origin'ы не пускает. Порт 2284, внутри всё уходит в 2283.
+  frame_proxy:
+    container_name: frame_proxy
+    image: nginx:1.27-alpine
+    volumes:
+      - ./frame_proxy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "2284:2284"
+    depends_on:
+      - immich-server
+    restart: unless-stopped
